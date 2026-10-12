@@ -12,8 +12,9 @@ from collections.abc import AsyncIterator
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langchain_core.callbacks import adispatch_custom_event
 
-from .citation_mapper import map_citations, normalize_references
+from .citation_mapper import extract_docx_references_with_llm, map_citations, normalize_references
 from .config import settings
 from .document_loader import load_document
 from .llm import ainvoke_json, check_llm
@@ -112,6 +113,10 @@ class WorkflowService:
         ):
             metadata = event.get("metadata", {})
             step = metadata.get("langgraph_node")
+            is_custom_progress = event.get("event") == "on_custom_event" and event.get("name") == "reference_normalization_progress"
+            if is_custom_progress:
+                yield {"type": "step_progress", "step": "agent1_extract", "progress": event.get("data", {})}
+                continue
             if step not in steps or event.get("name") != step:
                 continue
             if event.get("event") == "on_chain_start":
@@ -128,9 +133,21 @@ class WorkflowService:
         await check_llm()
         return {"task_id": str(uuid.uuid4()), "started_at": _now(), "warnings": [], "errors": [], "lookups": {}}
 
-    async def agent1_extract(self, state: WorkflowState) -> dict[str, Any]:
-        loaded = load_document(state["input_path"])
-        refs, warnings = await normalize_references(loaded.bibliography_entries)
+    async def agent1_extract(self, state: WorkflowState, config=None) -> dict[str, Any]:
+        input_path = Path(state["input_path"])
+        is_word = input_path.suffix.lower() in {".docx", ".doc"}
+        loaded = load_document(input_path, parse_references=not is_word)
+        async def report_progress(completed: int, total: int, status: str):
+            if config is not None:
+                await adispatch_custom_event(
+                    "reference_normalization_progress",
+                    {"completed": completed, "total": total, "status": status},
+                    config=config,
+                )
+        if is_word:
+            refs, warnings = await extract_docx_references_with_llm(loaded.full_text, progress=report_progress)
+        else:
+            refs, warnings = await normalize_references(loaded.bibliography_entries, progress=report_progress)
         refs = [ReferenceItem.model_validate(ref).model_dump(exclude_none=True) for ref in refs]
         if not refs:
             warnings.append("未识别到参考文献，后续无法进行逐条文献支持性评估。")

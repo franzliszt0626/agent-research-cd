@@ -51,6 +51,8 @@ class Settings:
     llm_temperature: float = _get_float("LLM_TEMPERATURE", 0.0)
     llm_timeout_seconds: int = _get_int("LLM_TIMEOUT_SECONDS", 120)
     llm_retries: int = _get_int("LLM_RETRIES", 1)
+    reference_normalization_batch_size: int = _get_int("REFERENCE_NORMALIZATION_BATCH_SIZE", 40)
+    reference_normalization_concurrency: int = _get_int("REFERENCE_NORMALIZATION_CONCURRENCY", 20)
     failed_node_retries: int = _get_int("FAILED_NODE_RETRIES", 2)
     failed_node_retry_delay_seconds: float = _get_float("FAILED_NODE_RETRY_DELAY_SECONDS", 1.0)
     confidence_threshold: float = _get_float("CONFIDENCE_THRESHOLD", 0.75)

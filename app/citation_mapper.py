@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+import asyncio
+import json
 from typing import Any
+from collections.abc import Awaitable, Callable
 
 from .config import settings
 from .llm import ainvoke_json
@@ -150,7 +153,7 @@ def _normalize_reference_shape(item: dict[str, Any], source: dict[str, str], ind
     }
 
 
-async def normalize_references(raw_entries: list[dict[str, str]]) -> tuple[list[dict[str, Any]], list[str]]:
+async def _normalize_references_serial_legacy(raw_entries: list[dict[str, str]]) -> tuple[list[dict[str, Any]], list[str]]:
     refs: list[dict[str, Any]] = []
     warnings: list[str] = []
     # Batch to avoid sending very long reference lists in one context window.
@@ -181,6 +184,122 @@ async def normalize_references(raw_entries: list[dict[str, str]]) -> tuple[list[
                 ref = _fallback_reference(entry['raw'], index, entry.get('bib_key', ''), entry.get('label', ''))
             refs.append(ref)
     return refs, warnings
+
+
+async def _normalize_references_concurrent(
+    raw_entries: list[dict[str, str]],
+    progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Use concurrent LLM batches while preserving deterministic input order."""
+    if not raw_entries:
+        return [], []
+    batch_size = max(1, settings.reference_normalization_batch_size)
+    semaphore = asyncio.Semaphore(max(1, settings.reference_normalization_concurrency))
+    system_prompt = (
+        "Extract bibliographic metadata. Return only JSON with a references array. "
+        "Preserve each index exactly. Use only text in that record; never invent. "
+        "Missing fields must be null or empty."
+    )
+
+    async def run_batch(start: int, batch: list[dict[str, str]]):
+        records = [{"index": start + offset + 1, "raw": entry.get("raw", ""),
+                    "bib_key": entry.get("bib_key", ""), "label": entry.get("label", "")}
+                   for offset, entry in enumerate(batch)]
+        try:
+            async with semaphore:
+                result = await ainvoke_json(
+                    system_prompt,
+                    "records=" + json.dumps(records, ensure_ascii=False, separators=(",", ":")),
+                    retries=settings.llm_retries,
+                )
+            items = result.get("references", []) if isinstance(result, dict) else []
+            return ({int(item["index"]): item for item in items
+                     if isinstance(item, dict) and str(item.get("index", "")).isdigit()}, "")
+        except Exception as exc:
+            return ({}, f"部分参考文献未能通过模型标准化，已使用规则解析兜底：{exc}")
+
+    batches = [(start, raw_entries[start:start + batch_size])
+               for start in range(0, len(raw_entries), batch_size)]
+    async def completed_batch(start: int, batch: list[dict[str, str]]):
+        items, warning = await run_batch(start, batch)
+        if progress:
+            await progress(start // batch_size + 1, len(batches), "error" if warning else "done")
+        return items, warning
+
+    results = await asyncio.gather(*(completed_batch(start, batch) for start, batch in batches))
+    model_items: dict[int, dict[str, Any]] = {}
+    warnings: list[str] = []
+    for items, warning in results:
+        model_items.update(items)
+        if warning:
+            warnings.append(warning)
+    refs: list[dict[str, Any]] = []
+    for index, entry in enumerate(raw_entries, 1):
+        try:
+            ref = _normalize_reference_shape(model_items.get(index, {}), entry, index)
+            ReferenceItem.model_validate(ref)
+        except (ValueError, TypeError) as exc:
+            warnings.append(f"Agent1 entry {index} validation failed; using source fields: {exc}")
+            ref = _fallback_reference(entry["raw"], index, entry.get("bib_key", ""), entry.get("label", ""))
+        refs.append(ref)
+    return refs, warnings
+
+
+async def extract_docx_references_with_llm(
+    document_text: str,
+    progress: Callable[[int, int, str], Awaitable[None]] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Let the model identify Word bibliography boundaries and entries directly."""
+    prompt = (
+        "Read the complete Word document below and extract every bibliography entry. "
+        "Ignore running headers, page numbers, acknowledgements, and body citations. "
+        "Do not split or merge entries based on page layout; an entry can wrap across lines. "
+        "Return only JSON: {\"references\":[{\"index\":1,\"original_reference\":\"...\","
+        "\"authors\":[\"...\"],\"year\":2024,\"title\":\"...\",\"venue\":\"...\","
+        "\"doi\":\"...\",\"url\":\"...\",\"normalized_citation\":\"...\"}]}. "
+        "Preserve the document order. Use only text present in the document; never invent."
+    )
+    try:
+        result = await ainvoke_json(prompt, "document=" + document_text, retries=settings.llm_retries)
+        items = result.get("references", []) if isinstance(result, dict) else []
+        refs: list[dict[str, Any]] = []
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict) or not str(item.get("original_reference", "")).strip():
+                continue
+            raw = str(item["original_reference"]).strip()
+            authors = item.get("authors", [])
+            if isinstance(authors, str):
+                authors = [authors]
+            year = item.get("year")
+            try:
+                year = int(year) if year not in (None, "", "null") else None
+            except (TypeError, ValueError):
+                year = None
+            ref = {
+                "reference_id": f"REF{index:04d}", "original_reference": raw,
+                "bib_key": "", "label": "", "authors": [str(a).strip() for a in authors if str(a).strip()][:20],
+                "year": year, "title": str(item.get("title") or "").strip()[:600],
+                "venue": str(item.get("venue") or "").strip()[:400],
+                "doi": str(item.get("doi") or "").strip(), "arxiv_id": "",
+                "url": str(item.get("url") or "").strip(), "access_date": "",
+                "normalized_citation": str(item.get("normalized_citation") or raw).strip(),
+                "citation_number": index,
+            }
+            try:
+                ReferenceItem.model_validate(ref)
+                refs.append(ref)
+            except (ValueError, TypeError):
+                continue
+        if progress:
+            await progress(1, 1, "done")
+        return refs, []
+    except Exception as exc:
+        if progress:
+            await progress(1, 1, "error")
+        return [], [f"Agent1 Word 文献抽取模型调用失败：{exc}"]
+
+
+normalize_references = _normalize_references_concurrent
 
 
 def _clean_sentence(text: str) -> str:

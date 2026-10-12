@@ -10,7 +10,7 @@ from docx import Document
 from pydantic import ValidationError
 
 from app.citation_mapper import (_fallback_reference, _match_citation, _normalize_reference_shape,
-                                 split_citation_claims, split_sentences)
+                                 extract_docx_references_with_llm, split_citation_claims, split_sentences)
 from app.document_loader import _extract_plain_entries, load_document
 from app.mcp_client import LiteratureClient, MCPFailure, decode_tool_result, exception_detail
 from app.mcp_server import _select_candidate, search_literature, _get_json, _openalex_result
@@ -51,6 +51,19 @@ class ParserTests(unittest.TestCase):
         ref = _fallback_reference(entries[1]["raw"], 2, label="9")
         self.assertTrue(_match_citation("检测效果改善[7–9]。", ref)[0])
         self.assertFalse(_match_citation("检测效果改善[2]。", ref)[0])
+
+    def test_wrapped_page_number_before_doi_is_not_reference_label(self):
+        section = (
+            "Fan, W., Zhou, Q., Qiu, L., & Kumar, S. (2023). A study. Journal, 34(2), 629–\n"
+            "651. https://doi.org/10.1287/example\n"
+            "Geng, S., Zhang, W., & Ram, S. (2026). Another study. MIS Quarterly, 50(3), 909–940.\n"
+            "Forty-Seventh International Conference on Information Systems, Lisbon, Portugal 2026\n8\n"
+            "Hong, W. S., & Taylor, R. A. (2019). Third study. JAMIA Open, 2(3), 346–352."
+        )
+        entries = _extract_plain_entries(section)
+        self.assertEqual(len(entries), 3)
+        self.assertTrue(entries[0]["raw"].endswith("10.1287/example"))
+        self.assertEqual([entry["label"] for entry in entries], ["", "", ""])
 
     def test_docx_boundaries_and_table_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,6 +208,21 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_word_reference_extraction_is_model_driven(self):
+        response = {"references": [{
+            "index": 1,
+            "original_reference": "Smith J. (2024). Model extracted paper.",
+            "authors": ["Smith J"], "year": 2024, "title": "Model extracted paper",
+            "venue": "Journal", "doi": "", "url": "",
+            "normalized_citation": "Smith J. (2024). Model extracted paper.",
+        }]}
+        with patch("app.citation_mapper.ainvoke_json", new=AsyncMock(return_value=response)) as model:
+            refs, warnings = await extract_docx_references_with_llm("Complete Word document text")
+        model.assert_awaited_once()
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["title"], "Model extracted paper")
+        self.assertEqual(warnings, [])
+
     async def test_model_preflight_aborts_before_document_or_mcp(self):
         service = WorkflowService()
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,6 +293,20 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         final = [event["report"] for event in events if event["type"] == "final"]
         self.assertEqual(len(final), 1)
         self.assertEqual(final[0]["statistics"]["passed"], 1)
+
+    async def test_reference_normalization_reports_batch_progress(self):
+        from app.citation_mapper import normalize_references
+        updates = []
+        entries = [{"raw": GB3, "bib_key": "", "label": str(i + 1)} for i in range(41)]
+        response = {"references": []}
+        async def progress(completed, total, status):
+            updates.append((completed, total, status))
+        with patch("app.citation_mapper.ainvoke_json", new=AsyncMock(return_value=response)) as model:
+            refs, _ = await normalize_references(entries, progress=progress)
+        self.assertEqual(model.await_count, 2)
+        self.assertEqual(len(refs), 41)
+        self.assertEqual({item[1] for item in updates}, {2})
+        self.assertEqual({item[0] for item in updates}, {1, 2})
 
     async def test_failed_review_retry_only_reruns_failed_pair(self):
         service = WorkflowService()

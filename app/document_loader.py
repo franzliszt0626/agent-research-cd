@@ -240,11 +240,24 @@ def _extract_plain_entries(section: str) -> list[dict[str, str]]:
     )
     current = ""
     current_label = ""
+    # Conference templates often repeat a running header and page number inside
+    # the references section. They are layout artifacts, not bibliography text;
+    # ignoring them prevents the next citation from absorbing an entire page.
+    page_artifact = re.compile(
+        r"^(?:\d{1,3}|(?:Forty[- ]Seventh|Forty[- ]Sixth)\s+International\s+Conference\s+on\s+Information\s+Systems,.*\d{4})$",
+        re.I,
+    )
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.lower().rstrip(":") in {"references", "bibliography", "works cited", "参考文献"}:
             continue
+        if page_artifact.match(stripped):
+            continue
         m = numeric_start.match(line)
+        # A wrapped page range may continue as ``651. https://doi.org/...``.
+        # It is part of the preceding citation, not bibliography item 651.
+        if m and m.group(2) and re.match(r"(?:https?://|doi\b)", m.group(3).strip(), re.I):
+            m = None
         author_year_starting = not current_label and bool(author_year_start.match(line))
         starts = bool(m) or author_year_starting or bool(GB_START.match(stripped))
         if starts:
@@ -271,7 +284,7 @@ def _extract_plain_entries(section: str) -> list[dict[str, str]]:
     return [e for e in entries if e["label"] or (len(e["raw"]) >= 15 and re.search(r"(?:19|20)\d{2}|doi|https?://|journal|proceedings|出版社", e["raw"], re.I))]
 
 
-def load_document(file_path: str | Path) -> LoadedDocument:
+def load_document(file_path: str | Path, *, parse_references: bool = True) -> LoadedDocument:
     path = Path(file_path).expanduser().resolve()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"找不到输入文件：{path}")
@@ -292,13 +305,13 @@ def load_document(file_path: str | Path) -> LoadedDocument:
         entries = _extract_thebibliography_entries(bibliography)
         if not entries:
             entries = _extract_bibtex_entries(bibliography or full_text)
-    if not entries and bibliography:
+    if parse_references and not entries and bibliography:
         entries = _extract_plain_entries(bibliography)
-    if not entries and ext in {".tex", ".latex"}:
+    if parse_references and not entries and ext in {".tex", ".latex"}:
         entries = _extract_bibtex_entries(full_text)
         if entries:
             warnings.append("未识别到独立参考文献标题，已从 LaTeX/BibTeX 条目中提取参考文献。")
-    if not entries:
+    if parse_references and not entries:
         warnings.append("未能自动解析出参考文献条目；请确认文档存在标准参考文献章节，或检查 LaTeX 的 .bib 文件是否与 .tex 放在同一目录。")
     return LoadedDocument(
         source_name=path.name,
