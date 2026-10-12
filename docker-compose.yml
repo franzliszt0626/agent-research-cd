@@ -1,0 +1,32 @@
+services:
+  mcp-literature:
+    build: .
+    command: ["python", "-m", "app.mcp_server"]
+    env_file:
+      - .env
+    environment:
+      UNPAYWALL_EMAIL: ${UNPAYWALL_EMAIL:-}
+      CROSSREF_MAILTO: ${CROSSREF_MAILTO:-}
+      OPENALEX_MAILTO: ${OPENALEX_MAILTO:-}
+    expose:
+      - "8001"
+    restart: unless-stopped
+
+  agent-research-cd:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    environment:
+      MCP_URL: http://mcp-literature:8001/mcp
+      MCP_TRANSPORT: http
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./output:/app/output
+      - ./uploads:/app/uploads
+    depends_on:
+      - mcp-literature
+    restart: unless-stopped
